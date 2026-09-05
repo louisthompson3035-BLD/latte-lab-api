@@ -1,26 +1,6 @@
 """
 LATTE LAB - Square POS Integration Backend (Belize Cash-Only Edition)
 =====================================================================
-Python Flask API that connects the mobile ordering app to Square POS.
-
-BELIZE REALITY CHECK:
-  - Online card payments require bank API access
-  - Belize banks (Atlantic, Belize Bank, etc.) make this extremely difficult
-  - SOLUTION: Cash on Pickup / Cash on Delivery / Online Bank Transfer
-  - Zero Square fees for cash/transfer orders
-  - Customer pays when they get their drink
-
-Features:
-  1. Menu Sync: Push Latte Lab menu into Square Catalog
-  2. Order Creation: Push customer orders into Square Orders API
-  3. Order Status: Pull order updates from Square back to the app
-  4. Webhooks: Receive real-time order status changes from Square
-
-Setup:
-  1. pip install -r requirements.txt
-  2. Set SQUARE_ACCESS_TOKEN and SQUARE_LOCATION_ID env vars
-  3. python api_server.py
-  4. For production, use ngrok or deploy to Render/Heroku
 """
 
 import os
@@ -36,12 +16,6 @@ from flask_cors import CORS
 SQUARE_ENV = os.environ.get('SQUARE_ENV', 'sandbox')
 SQUARE_ACCESS_TOKEN = os.environ.get('SQUARE_ACCESS_TOKEN', '')
 SQUARE_LOCATION_ID = os.environ.get('SQUARE_LOCATION_ID', '')
-SQUARE_APP_ID = os.environ.get('SQUARE_APP_ID', '')
-SQUARE_WEBHOOK_SECRET = os.environ.get('SQUARE_WEBHOOK_SECRET', '')
-
-# CURRENCY FIX: Sandbox accounts default to USD.
-# For testing with sandbox, set SQUARE_CURRENCY=USD in Render env vars.
-# For production (real Belize account), set SQUARE_CURRENCY=BZD.
 SQUARE_CURRENCY = os.environ.get('SQUARE_CURRENCY', 'BZD')
 
 BASE_URL = 'https://connect.squareupsandbox.com' if SQUARE_ENV == 'sandbox' else 'https://connect.squareup.com'
@@ -51,18 +25,13 @@ HEADERS = {
     'Content-Type': 'application/json'
 }
 
-# In-memory storage (replace with PostgreSQL for production)
 orders_db = {}
-customers_db = {}
 
 app = Flask(__name__)
 CORS(app)
 
 
-# ===================== SQUARE API HELPERS =====================
-
 def square_post(endpoint, payload):
-    """Generic POST to Square API."""
     url = f'{BASE_URL}{endpoint}'
     try:
         resp = requests.post(url, headers=HEADERS, json=payload, timeout=15)
@@ -76,7 +45,6 @@ def square_post(endpoint, payload):
 
 
 def square_get(endpoint):
-    """Generic GET from Square API."""
     url = f'{BASE_URL}{endpoint}'
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
@@ -88,8 +56,6 @@ def square_get(endpoint):
     except Exception as e:
         return {'errors': [{'detail': str(e)}]}, 500
 
-
-# ===================== MENU DATA =====================
 
 MENU_CATEGORIES = [
     {"id": "coffee", "name": "Coffee"},
@@ -178,18 +144,14 @@ MODIFIER_LISTS = {
 }
 
 
-# ===================== 1. MENU SYNC TO SQUARE =====================
-
 @app.route('/api/sync-menu-to-square', methods=['POST'])
 def sync_menu_to_square():
-    """Push all Latte Lab items, categories, and modifiers into Square Catalog."""
     if not SQUARE_ACCESS_TOKEN or not SQUARE_LOCATION_ID:
         return jsonify({"error": "Square credentials not configured"}), 400
 
     results = {"categories": [], "items": [], "modifiers": [], "errors": []}
     modifier_list_ids = {}
 
-    # Step 1: Create Modifier Lists
     for list_key, list_data in MODIFIER_LISTS.items():
         modifiers = []
         for mod in list_data["modifiers"]:
@@ -222,7 +184,6 @@ def sync_menu_to_square():
         else:
             results["errors"].append({"step": f"modifier_list_{list_key}", "detail": data})
 
-    # Step 2: Create Categories
     category_ids = {}
     for cat in MENU_CATEGORIES:
         payload = {
@@ -241,7 +202,6 @@ def sync_menu_to_square():
         else:
             results["errors"].append({"step": f"category_{cat['id']}", "detail": data})
 
-    # Step 3: Create Items with Variations
     for item in MENU_ITEMS:
         variations = []
         sizes = [
@@ -312,31 +272,8 @@ def sync_menu_to_square():
     })
 
 
-# ===================== 2. CREATE ORDER IN SQUARE =====================
-
 @app.route('/api/orders', methods=['POST'])
 def create_order():
-    """
-    Receives an order from the mobile app and creates it in Square.
-
-    BELIZE NOTE: No card processing through Square.
-    Customer pays via:
-      - Cash on pickup/delivery
-      - Online Bank Transfer (Atlantic Bank, Belize Bank, etc.)
-    Square records the order but does NOT process payment.
-    Zero Square fees for these order types.
-
-    Request body:
-    {
-        "customer_name": "John Doe",
-        "phone": "600-1234",
-        "address": "123 Street, Belize City",
-        "order_type": "pickup" | "delivery",
-        "payment_method": "cash" | "online_transfer",
-        "items": [...],
-        "total": 1300
-    }
-    """
     data = request.get_json()
     if not data:
         return jsonify({"error": "No data provided"}), 400
@@ -351,9 +288,11 @@ def create_order():
     for item in data.get("items", []):
         modifiers = []
         for mod in item.get("modifiers", []):
+            # FIX: Convert modifier price from dollars to cents
+            mod_price_cents = int(round(mod.get("price", 0) * 100))
             modifiers.append({
                 "name": mod["name"],
-                "base_price_money": {"amount": mod.get("price", 0), "currency": SQUARE_CURRENCY}
+                "base_price_money": {"amount": mod_price_cents, "currency": SQUARE_CURRENCY}
             })
 
         line_item = {
@@ -367,17 +306,16 @@ def create_order():
 
         square_line_items.append(line_item)
 
-    # Build fulfillment based on order type
     fulfillment_type = "PICKUP" if data.get("order_type") == "pickup" else "DELIVERY"
-    placed_at = datetime.utcnow().isoformat() + "Z"
 
-    # Payment note for Square
     if payment_method == "online_transfer":
-        payment_note = "ONLINE BANK TRANSFER. Customer will transfer via online banking. Staff to verify before preparing."
+        payment_note = "ONLINE BANK TRANSFER - verify before prep"
     else:
-        payment_note = "CASH ORDER. Customer pays on pickup/delivery."
+        payment_note = "CASH - pay on pickup/delivery"
 
+    # FIX: Simplified fulfillment structure, removed placed_at, added uid
     fulfillment = {
+        "uid": str(uuid.uuid4())[:8],
         "type": fulfillment_type,
         "state": "PROPOSED"
     }
@@ -385,25 +323,21 @@ def create_order():
     if fulfillment_type == "PICKUP":
         fulfillment["pickup_details"] = {
             "recipient": {
-                "display_name": data.get("customer_name", "Guest"),
-                "phone_number": data.get("phone", "")
+                "display_name": data.get("customer_name", "Guest")
             },
-            "note": f"{payment_note} Type: PICKUP.",
-            "placed_at": placed_at
+            "note": payment_note
         }
     else:
         fulfillment["delivery_details"] = {
             "recipient": {
-                "display_name": data.get("customer_name", "Guest"),
-                "phone_number": data.get("phone", "")
+                "display_name": data.get("customer_name", "Guest")
             },
             "address": {
                 "address_line_1": data.get("address", "Belize City"),
                 "country": "BZ",
                 "locality": "Belize City"
             },
-            "note": f"{payment_note} Type: DELIVERY.",
-            "placed_at": placed_at
+            "note": payment_note
         }
 
     square_payload = {
@@ -418,10 +352,8 @@ def create_order():
                 "latte_lab_order_id": local_order_id,
                 "customer_name": data.get("customer_name", ""),
                 "customer_phone": data.get("phone", ""),
-                "customer_address": data.get("address", ""),
                 "order_type": data.get("order_type", "pickup"),
-                "payment_method": payment_method,
-                "app_version": "1.0.0"
+                "payment_method": payment_method
             }
         }
     }
@@ -447,7 +379,7 @@ def create_order():
         }
         orders_db[local_order_id] = order_record
 
-        payment_msg = "Customer will pay via online bank transfer. Staff to verify transfer before preparing." if payment_method == "online_transfer" else "Customer pays cash on pickup/delivery."
+        payment_msg = "Customer will pay via online bank transfer." if payment_method == "online_transfer" else "Customer pays cash on pickup/delivery."
 
         return jsonify({
             "success": True,
@@ -458,14 +390,14 @@ def create_order():
             "message": payment_msg
         })
     else:
+        # Log the exact error for debugging
+        print(f"SQUARE ORDER ERROR: {json.dumps(resp_data)}")
         return jsonify({
             "success": False,
             "error": "Failed to create order in Square",
             "square_error": resp_data
         }), 500
 
-
-# ===================== 3. GET ORDER STATUS =====================
 
 @app.route('/api/orders/<order_id>', methods=['GET'])
 def get_order(order_id):
@@ -500,8 +432,6 @@ def list_orders():
     return jsonify({"orders": orders_list, "count": len(orders_list)})
 
 
-# ===================== 4. UPDATE ORDER STATUS (Admin) =====================
-
 @app.route('/api/orders/<order_id>/status', methods=['PUT'])
 def update_order_status(order_id):
     data = request.get_json()
@@ -516,8 +446,6 @@ def update_order_status(order_id):
 
     return jsonify({"success": True, "order_id": order_id, "status": new_status})
 
-
-# ===================== 5. SQUARE WEBHOOKS =====================
 
 @app.route('/api/webhooks/square', methods=['POST'])
 def square_webhook():
@@ -555,8 +483,6 @@ def square_webhook():
     return jsonify({"received": True}), 200
 
 
-# ===================== 6. APP CONFIG / HEALTH =====================
-
 @app.route('/api/config', methods=['GET'])
 def get_config():
     return jsonify({
@@ -567,7 +493,7 @@ def get_config():
         "delivery_fee": 0,
         "min_order": 0,
         "payment_methods": ["cash", "online_transfer"],
-        "payment_note": "Cash on pickup/delivery, or Online Bank Transfer (Atlantic Bank, Belize Bank, Heritage Bank).",
+        "payment_note": "Cash on pickup/delivery, or Online Bank Transfer.",
         "open_hours": {
             "mon": "7:00 AM - 8:00 PM",
             "tue": "7:00 AM - 8:00 PM",
@@ -601,32 +527,11 @@ def get_menu():
     })
 
 
-# ===================== MAIN =====================
-
 if __name__ == '__main__':
     print("=" * 60)
-    print("LATTE LAB - Square Integration Server (Belize Cash Edition)")
+    print("LATTE LAB - Square Integration Server")
     print("=" * 60)
     print(f"Square Environment: {SQUARE_ENV}")
-    print(f"Square Location ID: {SQUARE_LOCATION_ID or 'NOT SET'}")
-    print(f"Square Token: {'SET' if SQUARE_ACCESS_TOKEN else 'NOT SET'}")
     print(f"Currency: {SQUARE_CURRENCY}")
-    print()
-    print("PAYMENT: Cash + Online Bank Transfer")
-    print("Square Fees: $0.00 for cash/transfer orders")
-    print()
-    print("API Endpoints:")
-    print("  GET  /api/health              - Health check")
-    print("  GET  /api/config              - App configuration")
-    print("  GET  /api/menu                - Full menu data")
-    print("  POST /api/sync-menu-to-square - Push menu to Square Catalog")
-    print("  POST /api/orders              - Create new order")
-    print("  GET  /api/orders              - List all orders")
-    print("  GET  /api/orders/<id>         - Get order details")
-    print("  PUT  /api/orders/<id>/status  - Update order status")
-    print("  POST /api/webhooks/square     - Square webhook receiver")
-    print()
-    print("Starting server on http://localhost:5000")
     print("=" * 60)
-
     app.run(host='0.0.0.0', port=5000, debug=True)
