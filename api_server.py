@@ -371,7 +371,7 @@ def create_order():
             "order_type": data.get("order_type"),
             "payment_method": payment_method,
             "items": data.get("items"),
-            "total": data.get("total"),
+            "total": data.get("total", 0) / 100,
             "status": "pending",
             "square_status": square_order.get("state", "OPEN"),
             "created_at": datetime.utcnow().isoformat(),
