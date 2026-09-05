@@ -28,6 +28,7 @@ import os
 import uuid
 import json
 import requests
+import traceback
 from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -41,7 +42,7 @@ SQUARE_WEBHOOK_SECRET = os.environ.get('SQUARE_WEBHOOK_SECRET', '')
 
 BASE_URL = 'https://connect.squareupsandbox.com' if SQUARE_ENV == 'sandbox' else 'https://connect.squareup.com'
 HEADERS = {
-    'Square-Version': '2026-08-19',
+    'Square-Version': '2024-08-21',
     'Authorization': f'Bearer {SQUARE_ACCESS_TOKEN}',
     'Content-Type': 'application/json'
 }
@@ -61,7 +62,11 @@ def square_post(endpoint, payload):
     url = f'{BASE_URL}{endpoint}'
     try:
         resp = requests.post(url, headers=HEADERS, json=payload, timeout=15)
-        return resp.json(), resp.status_code
+        try:
+            data = resp.json()
+        except Exception:
+            data = {"raw_response": resp.text}
+        return data, resp.status_code
     except Exception as e:
         return {'errors': [{'detail': str(e)}]}, 500
 
@@ -71,7 +76,11 @@ def square_get(endpoint):
     url = f'{BASE_URL}{endpoint}'
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
-        return resp.json(), resp.status_code
+        try:
+            data = resp.json()
+        except Exception:
+            data = {"raw_response": resp.text}
+        return data, resp.status_code
     except Exception as e:
         return {'errors': [{'detail': str(e)}]}, 500
 
@@ -176,6 +185,7 @@ def sync_menu_to_square():
     results = {"categories": [], "items": [], "modifiers": [], "errors": []}
     modifier_list_ids = {}
 
+    # Step 1: Create Modifier Lists
     for list_key, list_data in MODIFIER_LISTS.items():
         modifiers = []
         for mod in list_data["modifiers"]:
@@ -202,11 +212,13 @@ def sync_menu_to_square():
 
         data, status = square_post('/v2/catalog/object', payload)
         if status == 200:
-            modifier_list_ids[list_key] = data["object"]["id"]
-            results["modifiers"].append({"name": list_data["name"], "square_id": data["object"]["id"]})
+            cat_obj = data.get("catalog_object", data.get("object", {}))
+            modifier_list_ids[list_key] = cat_obj.get("id", "")
+            results["modifiers"].append({"name": list_data["name"], "square_id": cat_obj.get("id", "")})
         else:
             results["errors"].append({"step": f"modifier_list_{list_key}", "detail": data})
 
+    # Step 2: Create Categories
     category_ids = {}
     for cat in MENU_CATEGORIES:
         payload = {
@@ -219,11 +231,13 @@ def sync_menu_to_square():
         }
         data, status = square_post('/v2/catalog/object', payload)
         if status == 200:
-            category_ids[cat["id"]] = data["object"]["id"]
-            results["categories"].append({"name": cat["name"], "square_id": data["object"]["id"]})
+            cat_obj = data.get("catalog_object", data.get("object", {}))
+            category_ids[cat["id"]] = cat_obj.get("id", "")
+            results["categories"].append({"name": cat["name"], "square_id": cat_obj.get("id", "")})
         else:
             results["errors"].append({"step": f"category_{cat['id']}", "detail": data})
 
+    # Step 3: Create Items with Variations
     for item in MENU_ITEMS:
         variations = []
         sizes = [
@@ -247,34 +261,38 @@ def sync_menu_to_square():
         modifier_list_info = []
         if item["customizable"]:
             for list_key in ["syrups", "cold_foam", "milk", "toppings"]:
-                if list_key in modifier_list_ids:
+                if list_key in modifier_list_ids and modifier_list_ids[list_key]:
                     modifier_list_info.append({
                         "modifier_list_id": modifier_list_ids[list_key],
                         "min_selected_modifiers": 0,
-                        "max_selected_modifiers": 0
+                        "max_selected_modifiers": 3
                     })
+
+        item_data = {
+            "name": item["name"],
+            "category_id": category_ids.get(item["category"], ""),
+            "variations": variations,
+            "description": f"Latte Lab - {item['name']}",
+            "available_online": True,
+            "available_for_pickup": True,
+            "available_for_delivery": True
+        }
+        if modifier_list_info:
+            item_data["modifier_list_info"] = modifier_list_info
 
         payload = {
             "idempotency_key": str(uuid.uuid4()),
             "object": {
                 "type": "ITEM",
                 "id": f"#{item['id']}",
-                "item_data": {
-                    "name": item["name"],
-                    "category_id": category_ids.get(item["category"], ""),
-                    "variations": variations,
-                    "modifier_list_info": modifier_list_info,
-                    "description": f"Latte Lab - {item['name']}",
-                    "available_online": True,
-                    "available_for_pickup": True,
-                    "available_for_delivery": True
-                }
+                "item_data": item_data
             }
         }
 
         data, status = square_post('/v2/catalog/object', payload)
         if status == 200:
-            results["items"].append({"name": item["name"], "square_id": data["object"]["id"]})
+            cat_obj = data.get("catalog_object", data.get("object", {}))
+            results["items"].append({"name": item["name"], "square_id": cat_obj.get("id", "")})
         else:
             results["errors"].append({"step": f"item_{item['id']}", "detail": data})
 
@@ -338,6 +356,39 @@ def create_order():
 
         square_line_items.append(line_item)
 
+    # Build fulfillment based on order type
+    fulfillment_type = "PICKUP" if data.get("order_type") == "pickup" else "DELIVERY"
+    placed_at = datetime.utcnow().isoformat() + "Z"
+
+    fulfillment = {
+        "type": fulfillment_type,
+        "state": "PROPOSED"
+    }
+
+    if fulfillment_type == "PICKUP":
+        fulfillment["pickup_details"] = {
+            "recipient": {
+                "display_name": data.get("customer_name", "Guest"),
+                "phone_number": data.get("phone", "")
+            },
+            "note": f"CASH ORDER from Latte Lab App. Type: PICKUP. Payment: CASH ON PICKUP",
+            "placed_at": placed_at
+        }
+    else:
+        fulfillment["delivery_details"] = {
+            "recipient": {
+                "display_name": data.get("customer_name", "Guest"),
+                "phone_number": data.get("phone", "")
+            },
+            "address": {
+                "address_line_1": data.get("address", "Belize City"),
+                "country": "BZ",
+                "locality": "Belize City"
+            },
+            "note": f"CASH DELIVERY from Latte Lab App. Customer pays driver.",
+            "placed_at": placed_at
+        }
+
     square_payload = {
         "idempotency_key": str(uuid.uuid4()),
         "order": {
@@ -345,20 +396,7 @@ def create_order():
             "reference_id": local_order_id,
             "source": {"name": "Latte Lab App"},
             "line_items": square_line_items,
-            "fulfillments": [
-                {
-                    "type": "PICKUP" if data.get("order_type") == "pickup" else "DELIVERY",
-                    "state": "PROPOSED",
-                    "pickup_details" if data.get("order_type") == "pickup" else "delivery_details": {
-                        "recipient": {
-                            "display_name": data.get("customer_name", "Guest"),
-                            "phone_number": data.get("phone", "")
-                        },
-                        "note": f"CASH ORDER from Latte Lab App. Type: {data.get('order_type', 'pickup').upper()}. Payment: CASH ON {data.get('order_type', 'pickup').upper()}",
-                        "placed_at": datetime.utcnow().isoformat() + "Z"
-                    }
-                }
-            ],
+            "fulfillments": [fulfillment],
             "metadata": {
                 "latte_lab_order_id": local_order_id,
                 "customer_name": data.get("customer_name", ""),
@@ -370,22 +408,6 @@ def create_order():
             }
         }
     }
-
-    if data.get("order_type") == "delivery":
-        square_payload["order"]["fulfillments"][0]["delivery_details"] = {
-            "recipient": {
-                "display_name": data.get("customer_name", "Guest"),
-                "phone_number": data.get("phone", "")
-            },
-            "address": {
-                "address_line_1": data.get("address", "Belize City"),
-                "country": "BZ",
-                "locality": "Belize City"
-            },
-            "note": f"CASH DELIVERY from Latte Lab App. Customer pays driver.",
-            "placed_at": datetime.utcnow().isoformat() + "Z"
-        }
-        del square_payload["order"]["fulfillments"][0]["pickup_details"]
 
     resp_data, status = square_post('/v2/orders', square_payload)
 
