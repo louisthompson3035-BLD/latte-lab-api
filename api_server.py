@@ -1,18 +1,15 @@
 """
-LATTE LAB - Square POS Integration Backend (Belize Cash-Only Edition)
-=====================================================================
+LATTE LAB - Square POS Integration Backend
 """
 
 import os
 import uuid
 import json
 import requests
-import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-# ===================== CONFIG =====================
 SQUARE_ENV = os.environ.get('SQUARE_ENV', 'sandbox')
 SQUARE_ACCESS_TOKEN = os.environ.get('SQUARE_ACCESS_TOKEN', '')
 SQUARE_LOCATION_ID = os.environ.get('SQUARE_LOCATION_ID', '')
@@ -280,7 +277,7 @@ def create_order():
 
     payment_method = data.get("payment_method", "cash")
     if payment_method not in ["cash", "online_transfer"]:
-        return jsonify({"error": "Invalid payment method. Use 'cash' or 'online_transfer'"}), 400
+        return jsonify({"error": "Invalid payment method"}), 400
 
     local_order_id = f"LL{datetime.now().strftime('%H%M%S')}{str(uuid.uuid4())[:4].upper()}"
 
@@ -288,7 +285,6 @@ def create_order():
     for item in data.get("items", []):
         modifiers = []
         for mod in item.get("modifiers", []):
-            # FIX: Convert modifier price from dollars to cents
             mod_price_cents = int(round(mod.get("price", 0) * 100))
             modifiers.append({
                 "name": mod["name"],
@@ -313,7 +309,9 @@ def create_order():
     else:
         payment_note = "CASH - pay on pickup/delivery"
 
-    # FIX: Simplified fulfillment structure, removed placed_at, added uid
+    # FIX: Square requires pickup_at for scheduled pickups. Set to 30 min from now.
+    future_time = (datetime.utcnow() + timedelta(minutes=30)).isoformat() + "Z"
+
     fulfillment = {
         "uid": str(uuid.uuid4())[:8],
         "type": fulfillment_type,
@@ -325,7 +323,8 @@ def create_order():
             "recipient": {
                 "display_name": data.get("customer_name", "Guest")
             },
-            "note": payment_note
+            "note": payment_note,
+            "pickup_at": future_time  # <-- THIS WAS MISSING!
         }
     else:
         fulfillment["delivery_details"] = {
@@ -337,7 +336,8 @@ def create_order():
                 "country": "BZ",
                 "locality": "Belize City"
             },
-            "note": payment_note
+            "note": payment_note,
+            "deliver_at": future_time
         }
 
     square_payload = {
@@ -390,7 +390,6 @@ def create_order():
             "message": payment_msg
         })
     else:
-        # Log the exact error for debugging
         print(f"SQUARE ORDER ERROR: {json.dumps(resp_data)}")
         return jsonify({
             "success": False,
